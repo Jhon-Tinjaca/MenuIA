@@ -1,19 +1,45 @@
-import os
 import json
+import os
+import tempfile
+import time
 import gradio as gr
 import pandas as pd
-from PIL import Image
 from google import genai
 from google.genai import types
 
-# Obtener API Key de las variables de entorno de Render
-GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY')
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+client = genai.Client(api_key=GOOGLE_API_KEY) if GOOGLE_API_KEY else None
 
-if GOOGLE_API_KEY:
-    client = genai.Client(api_key=GOOGLE_API_KEY)
-else:
-    client = None
-    print("ADVERTENCIA: API Key no configurada.")
+MODELO_PRINCIPAL = "gemini-3.8-flash"
+MODELO_RESPALDO = "gemini-3.5-flash-lite"
+
+
+def generar_contenido_con_reintento(imagen, prompt):
+    modelos = [MODELO_PRINCIPAL, MODELO_RESPALDO]
+    ultimo_error = None
+
+    for modelo in modelos:
+        for intento in range(3):
+            try:
+                return client.models.generate_content(
+                    model=modelo,
+                    contents=[imagen, prompt],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                    ),
+                )
+            except Exception as e:
+                ultimo_error = e
+                es_503 = "503" in str(e) or "UNAVAILABLE" in str(e).upper()
+                if es_503 and intento < 2:
+                    time.sleep(2 ** intento)
+                    continue
+                if es_503:
+                    break
+                raise
+
+    raise ultimo_error
+
 
 def procesar_menu_gradio(imagen):
     if not client:
@@ -30,30 +56,33 @@ def procesar_menu_gradio(imagen):
             "exactamente estas cuatro claves: 'Producto', 'Ingredientes', 'Precio', 'Restaurante'."
         )
 
-        # Se usa gemini-3.8-flash como lo solicitó la API
-        response = client.models.generate_content(
-            model='gemini-3.8-flash',
-            contents=[imagen, prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-            )
-        )
+        response = generar_contenido_con_reintento(imagen, prompt)
+        datos = json.loads(response.text)
 
-        productos = json.loads(response.text)
+        if isinstance(datos, dict):
+            productos = datos.get("productos") or datos.get("items") or [datos]
+        elif isinstance(datos, list):
+            productos = datos
+        else:
+            productos = []
+
         if not productos:
             return "⚠️ No se pudo extraer ningún producto de la imagen.", None
 
-        ruta_excel = "menu_extraido_gradio.xlsx"
         df = pd.DataFrame(productos)
-        if 'Restaurante' in df.columns:
-            cols = [c for c in df.columns if c != 'Restaurante'] + ['Restaurante']
+        if "Restaurante" in df.columns:
+            cols = [c for c in df.columns if c != "Restaurante"] + ["Restaurante"]
             df = df[cols]
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            ruta_excel = tmp.name
 
         df.to_excel(ruta_excel, index=False)
         return f"✅ ¡Procesado con éxito! Se extrajeron {len(productos)} productos.", ruta_excel
 
     except Exception as e:
         return f"❌ Error: {str(e)}", None
+
 
 with gr.Blocks() as demo:
     gr.Markdown("<h1 style='text-align: center; color: #1a73e8;'>🍽️ Extractor de Menús IA</h1>")
@@ -67,8 +96,14 @@ with gr.Blocks() as demo:
             texto_salida = gr.Textbox(label="Estado del Proceso", interactive=False)
             archivo_salida = gr.File(label="Descargar Excel")
 
-    boton_procesar.click(fn=procesar_menu_gradio, inputs=[imagen_entrada], outputs=[texto_salida, archivo_salida])
+    boton_procesar.click(
+        fn=procesar_menu_gradio,
+        inputs=[imagen_entrada],
+        outputs=[texto_salida, archivo_salida],
+    )
 
 if __name__ == "__main__":
-    # Configuración vital para Render
-    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("PORT", 7860)),
+    )
